@@ -3,6 +3,8 @@
 // 端点：
 //   GET  /v1/models            模型列表（OpenAI 格式）
 //   POST /v1/chat/completions  聊天补全（支持 stream / 非 stream）
+//   POST /v1/responses         OpenAI Responses API（支持 stream / 非 stream）
+//   POST /v1/messages          Anthropic Messages API（支持 stream / 非 stream）
 //   GET  /healthz              健康检查
 //
 // 用法：
@@ -12,6 +14,14 @@
 import { createServer } from 'node:http';
 import { randomUUID } from 'node:crypto';
 import { config } from './config.mjs';
+import {
+  anthropicInputToMessages,
+  buildAnthropicMessage,
+  buildOpenAiResponse,
+  contentToText,
+  resolveAnthropicModel,
+  responsesInputToMessages,
+} from './protocols.mjs';
 import {
   DEFAULT_SIGN_KEY, PROXY_URL, fetchSignKey, getModels, fetchSessionList, chat, TabbitError,
 } from '../scripts/lib/tabbit.mjs';
@@ -78,8 +88,14 @@ function readBody(req) {
 
 function checkAuth(req) {
   if (!config.apiKey) return true;
-  const auth = req.headers['authorization'] || '';
-  return auth === `Bearer ${config.apiKey}`;
+  const auth = headerValue(req.headers['authorization']);
+  const apiKey = headerValue(req.headers['x-api-key']);
+  return auth === `Bearer ${config.apiKey}` || apiKey === config.apiKey;
+}
+
+function headerValue(value) {
+  if (Array.isArray(value)) return value[0] || '';
+  return value || '';
 }
 
 // OpenAI messages 数组 → Tabbit content 字符串
@@ -88,9 +104,27 @@ function checkAuth(req) {
 function messagesToContent(messages) {
   const valid = messages.filter(m => m && m.content != null);
   if (valid.length === 0) throw new Error('messages 为空');
-  if (valid.length === 1) return String(valid[0].content);
-  const roleLabel = { assistant: 'Assistant', system: 'System', user: 'User' };
-  return valid.map(m => `[${roleLabel[m.role] || 'User'}]\n${m.content}`).join('\n\n');
+  if (valid.length === 1) return contentToText(valid[0].content);
+  const roleLabel = { assistant: 'Assistant', developer: 'Developer', system: 'System', user: 'User' };
+  return valid.map(m => `[${roleLabel[m.role] || 'User'}]\n${contentToText(m.content)}`).join('\n\n');
+}
+
+async function collectTabbitText({ model, key, sessionId, content }) {
+  let full = '';
+  for await (const ev of chat({ cookie: config.cookie, version: config.version, signKey: key, sessionId, model, content })) {
+    if (ev.event === 'message_chunk' && ev.data?.content) {
+      full += ev.data.content;
+    } else if (ev.event === 'error') {
+      invalidateSession();
+      throw new Error(ev.data?.message || 'Tabbit error');
+    }
+  }
+  return full;
+}
+
+function writeSse(res, event, data) {
+  if (event) res.write(`event: ${event}\n`);
+  res.write(`data: ${JSON.stringify(data)}\n\n`);
 }
 
 // ─── 路由处理 ─────────────────────────────────────────────
@@ -220,6 +254,234 @@ async function handleChat(req, res, rawBody) {
   res.end();
 }
 
+// POST /v1/responses
+async function handleResponses(req, res, rawBody) {
+  let body;
+  try { body = JSON.parse(rawBody); }
+  catch { return sendJson(res, 400, { error: { message: 'invalid JSON body' } }); }
+
+  const { model = 'Default', stream = false } = body;
+  let messages;
+  try {
+    messages = responsesInputToMessages(body);
+  } catch (e) {
+    return sendJson(res, 400, { error: { message: e.message } });
+  }
+
+  let key, sessionId, content;
+  try {
+    [key, sessionId] = await Promise.all([ensureSignKey(), getSessionId()]);
+    content = messagesToContent(messages);
+  } catch (e) {
+    return sendJson(res, 502, { error: { message: 'prepare failed: ' + e.message } });
+  }
+
+  const id = `resp_${randomUUID().replace(/-/g, '').slice(0, 24)}`;
+  const outputId = `msg_${randomUUID().replace(/-/g, '').slice(0, 24)}`;
+  const created = Math.floor(Date.now() / 1000);
+
+  if (!stream) {
+    try {
+      const full = await collectTabbitText({ model, key, sessionId, content });
+      return sendJson(res, 200, buildOpenAiResponse({ id, outputId, created, model, text: full }));
+    } catch (e) {
+      if (e instanceof TabbitError) invalidateSession();
+      return sendJson(res, 502, { error: { message: e.message } });
+    }
+  }
+
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    'Cache-Control': 'no-cache',
+    'Connection': 'keep-alive',
+    'Access-Control-Allow-Origin': '*',
+  });
+
+  const ac = new AbortController();
+  req.on('close', () => ac.abort());
+
+  const started = buildOpenAiResponse({ id, outputId, created, model, text: '' });
+  started.status = 'in_progress';
+  started.output = [];
+  writeSse(res, 'response.created', { type: 'response.created', response: started });
+  writeSse(res, 'response.in_progress', { type: 'response.in_progress', response: started });
+  writeSse(res, 'response.output_item.added', {
+    type: 'response.output_item.added',
+    response_id: id,
+    output_index: 0,
+    item: { id: outputId, type: 'message', status: 'in_progress', role: 'assistant', content: [] },
+  });
+  writeSse(res, 'response.content_part.added', {
+    type: 'response.content_part.added',
+    response_id: id,
+    item_id: outputId,
+    output_index: 0,
+    content_index: 0,
+    part: { type: 'output_text', text: '', annotations: [] },
+  });
+
+  let full = '';
+  let failed = false;
+  try {
+    for await (const ev of chat({ cookie: config.cookie, version: config.version, signKey: key, sessionId, model, content, signal: ac.signal })) {
+      if (ev.event === 'message_chunk' && ev.data?.content) {
+        full += ev.data.content;
+        writeSse(res, 'response.output_text.delta', {
+          type: 'response.output_text.delta',
+          response_id: id,
+          item_id: outputId,
+          output_index: 0,
+          content_index: 0,
+          delta: ev.data.content,
+        });
+      } else if (ev.event === 'error') {
+        failed = true;
+        invalidateSession();
+        writeSse(res, 'response.failed', {
+          type: 'response.failed',
+          response: { ...started, status: 'failed', error: { message: ev.data?.message || 'Tabbit error', code: ev.data?.code } },
+        });
+        break;
+      }
+    }
+  } catch (e) {
+    if (e.name !== 'AbortError') {
+      failed = true;
+      if (e instanceof TabbitError) invalidateSession();
+      writeSse(res, 'response.failed', {
+        type: 'response.failed',
+        response: { ...started, status: 'failed', error: { message: e.message } },
+      });
+    }
+  }
+
+  if (!failed && !ac.signal.aborted) {
+    writeSse(res, 'response.output_text.done', {
+      type: 'response.output_text.done',
+      response_id: id,
+      item_id: outputId,
+      output_index: 0,
+      content_index: 0,
+      text: full,
+    });
+    writeSse(res, 'response.content_part.done', {
+      type: 'response.content_part.done',
+      response_id: id,
+      item_id: outputId,
+      output_index: 0,
+      content_index: 0,
+      part: { type: 'output_text', text: full, annotations: [] },
+    });
+    writeSse(res, 'response.output_item.done', {
+      type: 'response.output_item.done',
+      response_id: id,
+      output_index: 0,
+      item: { id: outputId, type: 'message', status: 'completed', role: 'assistant', content: [{ type: 'output_text', text: full, annotations: [] }] },
+    });
+    writeSse(res, 'response.completed', {
+      type: 'response.completed',
+      response: buildOpenAiResponse({ id, outputId, created, model, text: full }),
+    });
+  }
+
+  res.write('data: [DONE]\n\n');
+  res.end();
+}
+
+// POST /v1/messages (Anthropic Messages API)
+async function handleAnthropicMessages(req, res, rawBody) {
+  let body;
+  try { body = JSON.parse(rawBody); }
+  catch { return sendJson(res, 400, { type: 'error', error: { type: 'invalid_request_error', message: 'invalid JSON body' } }); }
+
+  const requestedModel = body.model || 'Claude-Sonnet-4.6';
+  const model = resolveAnthropicModel(requestedModel);
+  let messages;
+  try {
+    messages = anthropicInputToMessages(body);
+  } catch (e) {
+    return sendJson(res, 400, { type: 'error', error: { type: 'invalid_request_error', message: e.message } });
+  }
+
+  let key, sessionId, content;
+  try {
+    [key, sessionId] = await Promise.all([ensureSignKey(), getSessionId()]);
+    content = messagesToContent(messages);
+  } catch (e) {
+    return sendJson(res, 502, { type: 'error', error: { type: 'api_error', message: 'prepare failed: ' + e.message } });
+  }
+
+  const id = `msg_${randomUUID().replace(/-/g, '').slice(0, 24)}`;
+
+  if (!body.stream) {
+    try {
+      const full = await collectTabbitText({ model, key, sessionId, content });
+      return sendJson(res, 200, buildAnthropicMessage({ id, model: requestedModel, text: full }));
+    } catch (e) {
+      if (e instanceof TabbitError) invalidateSession();
+      return sendJson(res, 502, { type: 'error', error: { type: 'api_error', message: e.message } });
+    }
+  }
+
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    'Cache-Control': 'no-cache',
+    'Connection': 'keep-alive',
+    'Access-Control-Allow-Origin': '*',
+  });
+
+  const ac = new AbortController();
+  req.on('close', () => ac.abort());
+
+  writeSse(res, 'message_start', {
+    type: 'message_start',
+    message: { id, type: 'message', role: 'assistant', model: requestedModel, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 0, output_tokens: 0 } },
+  });
+  writeSse(res, 'content_block_start', {
+    type: 'content_block_start',
+    index: 0,
+    content_block: { type: 'text', text: '' },
+  });
+
+  let failed = false;
+  try {
+    for await (const ev of chat({ cookie: config.cookie, version: config.version, signKey: key, sessionId, model, content, signal: ac.signal })) {
+      if (ev.event === 'message_chunk' && ev.data?.content) {
+        writeSse(res, 'content_block_delta', {
+          type: 'content_block_delta',
+          index: 0,
+          delta: { type: 'text_delta', text: ev.data.content },
+        });
+      } else if (ev.event === 'error') {
+        failed = true;
+        invalidateSession();
+        writeSse(res, 'error', {
+          type: 'error',
+          error: { type: 'api_error', message: ev.data?.message || 'Tabbit error' },
+        });
+        break;
+      }
+    }
+  } catch (e) {
+    if (e.name !== 'AbortError') {
+      failed = true;
+      if (e instanceof TabbitError) invalidateSession();
+      writeSse(res, 'error', { type: 'error', error: { type: 'api_error', message: e.message } });
+    }
+  }
+
+  if (!failed && !ac.signal.aborted) {
+    writeSse(res, 'content_block_stop', { type: 'content_block_stop', index: 0 });
+    writeSse(res, 'message_delta', {
+      type: 'message_delta',
+      delta: { stop_reason: 'end_turn', stop_sequence: null },
+      usage: { output_tokens: 0 },
+    });
+    writeSse(res, 'message_stop', { type: 'message_stop' });
+  }
+  res.end();
+}
+
 // ─── HTTP 服务 ────────────────────────────────────────────
 const server = createServer(async (req, res) => {
   // CORS 预检
@@ -227,7 +489,7 @@ const server = createServer(async (req, res) => {
     res.writeHead(204, {
       'Access-Control-Allow-Origin': '*',
       'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+      'Access-Control-Allow-Headers': 'Content-Type, Authorization, x-api-key, anthropic-version, anthropic-beta',
     });
     return res.end();
   }
@@ -244,6 +506,14 @@ const server = createServer(async (req, res) => {
     if (path === '/v1/chat/completions' && req.method === 'POST') {
       const raw = await readBody(req);
       return await handleChat(req, res, raw);
+    }
+    if (path === '/v1/responses' && req.method === 'POST') {
+      const raw = await readBody(req);
+      return await handleResponses(req, res, raw);
+    }
+    if (path === '/v1/messages' && req.method === 'POST') {
+      const raw = await readBody(req);
+      return await handleAnthropicMessages(req, res, raw);
     }
     if (path === '/healthz' && req.method === 'GET') return await handleHealth(res);
     sendJson(res, 404, { error: { message: `not found: ${req.method} ${path}` } });
@@ -264,6 +534,8 @@ server.listen(config.port, () => {
   console.log('───────────────────────────────────────────────────────────');
   console.log('  GET  /v1/models             模型列表');
   console.log('  POST /v1/chat/completions   聊天补全 (stream / 非 stream)');
+  console.log('  POST /v1/responses          OpenAI Responses (stream / 非 stream)');
+  console.log('  POST /v1/messages           Anthropic Messages (stream / 非 stream)');
   console.log('  GET  /healthz               健康检查');
   console.log('═══════════════════════════════════════════════════════════\n');
 });
