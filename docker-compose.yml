@@ -1,0 +1,27 @@
+services:
+  tabbit:
+    build:
+      context: .
+      args:
+        HTTP_PROXY: http://192.168.5.46:10808
+        HTTPS_PROXY: http://192.168.5.46:10808
+        NO_PROXY: localhost,127.0.0.1,::1
+    image: tabbit2api:latest
+    container_name: tabbit2api
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      TABBIT_HTTP_PROXY: http://192.168.5.46:10808
+      HTTP_PROXY: http://192.168.5.46:10808
+      HTTPS_PROXY: http://192.168.5.46:10808
+      NO_PROXY: localhost,127.0.0.1,::1
+    volumes:
+      - ./tabbit.env:/app/.env:ro
+    ports:
+      - "8787:8787"
+    healthcheck:
+      test: ["CMD", "node", "-e", "const net = require('node:net'); const s = net.connect(8787, '127.0.0.1'); s.on('connect', () => { s.destroy(); process.exit(0); }); s.on('error', () => process.exit(1)); setTimeout(() => process.exit(1), 5000);"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s

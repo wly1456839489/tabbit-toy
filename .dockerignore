@@ -1,8 +1,9 @@
-node_modules/
+.git
 .env
 tabbit.env
-logs/
+node_modules
+logs
 *.log
-cookies/
+cookies
 cookie-helper-extension/.*
 _server.log

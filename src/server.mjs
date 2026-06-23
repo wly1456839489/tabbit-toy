@@ -13,7 +13,7 @@ import { createServer } from 'node:http';
 import { randomUUID } from 'node:crypto';
 import { config } from './config.mjs';
 import {
-  DEFAULT_SIGN_KEY, fetchSignKey, getModels, fetchSessionList, chat, TabbitError,
+  DEFAULT_SIGN_KEY, PROXY_URL, fetchSignKey, getModels, fetchSessionList, chat, TabbitError,
 } from '../scripts/lib/tabbit.mjs';
 
 // ─── 状态缓存 ─────────────────────────────────────────────
@@ -260,6 +260,7 @@ server.listen(config.port, () => {
   console.log(`  端口: ${config.port}`);
   console.log(`  鉴权: ${config.apiKey ? '已开启 (Bearer ' + config.apiKey.slice(0, 4) + '…)' : '未开启'}`);
   console.log(`  版本: ${config.version}`);
+  console.log(`  HTTP proxy: ${PROXY_URL ? 'enabled' : 'disabled'}`);
   console.log('───────────────────────────────────────────────────────────');
   console.log('  GET  /v1/models             模型列表');
   console.log('  POST /v1/chat/completions   聊天补全 (stream / 非 stream)');

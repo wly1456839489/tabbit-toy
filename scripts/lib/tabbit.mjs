@@ -5,6 +5,33 @@ import { randomUUID, createHash, createHmac } from 'node:crypto';
 export const DEFAULT_SIGN_KEY = 'f8d0e6a73f8d4b1a9c3d2e1f9a4b7c6d';
 export const BASE = 'https://web.tabbit.ai';
 
+function firstProxyEnv() {
+  return process.env.TABBIT_HTTP_PROXY
+    || process.env.TABBIT_HTTPS_PROXY
+    || process.env.HTTPS_PROXY
+    || process.env.HTTP_PROXY
+    || process.env.https_proxy
+    || process.env.http_proxy
+    || '';
+}
+
+function normalizeProxyUrl(value) {
+  const raw = value.trim();
+  if (!raw) return '';
+  const url = new URL(raw);
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+    throw new Error(`Unsupported proxy protocol: ${url.protocol}`);
+  }
+  return url.href;
+}
+
+export const PROXY_URL = normalizeProxyUrl(firstProxyEnv());
+
+if (PROXY_URL) {
+  const { ProxyAgent, setGlobalDispatcher } = await import('undici');
+  setGlobalDispatcher(new ProxyAgent(PROXY_URL));
+}
+
 // ─── 基础哈希 ───────────────────────────────────────────────
 export function sha256Hex(text) {
   return createHash('sha256').update(text, 'utf8').digest('hex');

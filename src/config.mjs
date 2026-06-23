@@ -5,9 +5,12 @@ import { readFileSync, existsSync } from 'node:fs';
 function loadEnvFile() {
   const env = {};
   if (existsSync('.env')) {
-    for (const line of readFileSync('.env', 'utf8').split('\n')) {
-      const m = line.match(/^([A-Z_]+)=(.*)$/);
-      if (m) env[m[1]] = m[2];
+    for (const rawLine of readFileSync('.env', 'utf8').split('\n')) {
+      const line = rawLine.endsWith('\r') ? rawLine.slice(0, -1) : rawLine;
+      const idx = line.indexOf('=');
+      if (idx <= 0) continue;
+      const key = line.slice(0, idx).trim();
+      if (/^[A-Z_][A-Z0-9_]*$/.test(key)) env[key] = line.slice(idx + 1);
     }
   }
   return env;

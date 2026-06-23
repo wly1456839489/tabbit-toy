@@ -10,5 +10,8 @@
     "probe:models": "node scripts/probe.mjs --step models",
     "probe:nopro": "node scripts/probe.mjs --no-pro",
     "start": "node src/server.mjs"
+  },
+  "dependencies": {
+    "undici": "^6.0.0"
   }
 }
