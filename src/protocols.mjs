@@ -26,10 +26,67 @@ function contentPartToText(part) {
   if (part.type === 'tool_result') {
     return `[Tool result]\n${contentToText(part.content)}`;
   }
-  if (part.type === 'image' || part.type === 'input_image') return '[Image input omitted]';
+  if (contentPartToImage(part)) return '';
   if (part.type === 'input_file') return '[File input omitted]';
 
   return '';
+}
+
+export function contentToImages(content) {
+  const images = [];
+  collectImages(content, images);
+  return images;
+}
+
+function collectImages(content, images) {
+  if (content == null) return;
+  if (Array.isArray(content)) {
+    for (const item of content) collectImages(item, images);
+    return;
+  }
+  if (typeof content !== 'object') return;
+
+  const image = contentPartToImage(content);
+  if (image) images.push(image);
+  if (Array.isArray(content.content)) collectImages(content.content, images);
+}
+
+function contentPartToImage(part) {
+  if (!part || typeof part !== 'object') return null;
+
+  if (part.type === 'input_image' || part.type === 'image_url') {
+    return imageFromUrlValue(part.image_url ?? part.url, part);
+  }
+
+  if (part.type === 'image') {
+    if (part.source && typeof part.source === 'object') {
+      if (part.source.type === 'base64' && typeof part.source.data === 'string') {
+        return {
+          source: 'base64',
+          data: part.source.data,
+          mediaType: part.source.media_type || part.source.mediaType || part.media_type || part.mediaType,
+          filename: part.filename || part.name,
+        };
+      }
+      if (part.source.type === 'url') {
+        return imageFromUrlValue(part.source.url, part);
+      }
+    }
+    return imageFromUrlValue(part.image_url ?? part.url, part);
+  }
+
+  return null;
+}
+
+function imageFromUrlValue(value, part = {}) {
+  const url = typeof value === 'string' ? value : value?.url;
+  if (!url) return null;
+  return {
+    source: 'url',
+    url,
+    detail: part.detail,
+    filename: part.filename || part.name,
+  };
 }
 
 export function responsesInputToMessages(body) {

@@ -193,17 +193,231 @@ export async function getModels(cookie, version, signKey) {
 // ─── 聊天补全（POST /api/v1/chat/completion，SSE）─────────
 // yield { event, data(已 parse), raw } 事件
 // content 为发给 Tabbit 的文本；model 为 selected_model（display_name）
-export async function* chat({ cookie, version, signKey, sessionId, model = 'Default', content, signal }) {
+const MAX_IMAGE_UPLOAD_BYTES = 20 * 1024 * 1024;
+const MIME_EXTENSIONS = {
+  'image/gif': 'gif',
+  'image/jpeg': 'jpg',
+  'image/png': 'png',
+  'image/webp': 'webp',
+};
+
+async function uploadImageReferences({ cookie, version, signKey, images = [], signal }) {
+  const references = [];
+  for (let i = 0; i < images.length; i++) {
+    references.push(await uploadImageReference({ cookie, version, signKey, image: images[i], index: i, signal }));
+  }
+  return references;
+}
+
+async function uploadImageReference({ cookie, version, signKey, image, index, signal }) {
+  const file = await readImageInput(image, index, signal);
+  if (file.buffer.byteLength > MAX_IMAGE_UPLOAD_BYTES) {
+    throw new Error(`image too large: ${file.name} (${file.buffer.byteLength} bytes)`);
+  }
+
+  const upload = await createPresignedUpload({
+    cookie,
+    version,
+    signKey,
+    fileName: file.name,
+    contentType: file.contentType,
+    signal,
+  });
+
+  const putRes = await fetch(upload.presignedUrl, {
+    method: 'PUT',
+    headers: { 'Content-Type': file.contentType },
+    body: file.buffer,
+    signal,
+  });
+  if (!putRes.ok) {
+    throw new Error(`image upload failed: ${putRes.status} ${putRes.statusText}`);
+  }
+
+  await completeUpload({ cookie, version, signKey, fileId: upload.fileId, signal });
+  return makeImageReference({
+    fileName: file.name,
+    url: upload.downloadUrl || upload.presignedUrl.split('?')[0],
+    fileId: upload.fileId,
+  });
+}
+
+async function createPresignedUpload({ cookie, version, signKey, fileName, contentType, signal }) {
+  const body = JSON.stringify({
+    file_category: 'image',
+    original_filename: fileName,
+    content_type: contentType,
+    need_download_url: true,
+    download_expires_in: 1728000,
+  });
+  const res = await fetch(`${BASE}/proxy/v0/cos/presigned-upload-url`, {
+    method: 'POST',
+    headers: {
+      ...baseHeaders(cookie, version, true),
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+      ...signHeaders(body, signKey),
+    },
+    body,
+    signal,
+  });
+  const text = await res.text();
+  if (!res.ok) throw new TabbitError(res.status, text);
+  let parsed;
+  try { parsed = JSON.parse(text); } catch { throw new TabbitError(res.status, text); }
+  const data = parsed?.data || parsed;
+  if (!data?.url || !data?.file_id) {
+    throw new Error('invalid presigned upload response');
+  }
+  return { presignedUrl: data.url, fileId: data.file_id, downloadUrl: data.download_url };
+}
+
+async function completeUpload({ cookie, version, signKey, fileId, signal }) {
+  const body = JSON.stringify({ file_id: fileId });
+  const res = await fetch(`${BASE}/proxy/v0/cos/complete-upload`, {
+    method: 'POST',
+    headers: {
+      ...baseHeaders(cookie, version, true),
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+      ...signHeaders(body, signKey),
+    },
+    body,
+    signal,
+  });
+  const text = await res.text();
+  if (!res.ok) throw new TabbitError(res.status, text);
+}
+
+async function readImageInput(image, index, signal) {
+  if (image?.source === 'base64') {
+    const contentType = normalizeContentType(image.mediaType || 'image/png');
+    return {
+      name: sanitizeFileName(image.filename || `image-${index + 1}.${extensionFromContentType(contentType)}`),
+      contentType,
+      buffer: Buffer.from(image.data, 'base64'),
+    };
+  }
+
+  const url = image?.url;
+  if (!url) throw new Error('image_url is required');
+  if (url.startsWith('data:')) {
+    const parsed = parseDataUrl(url);
+    return {
+      name: sanitizeFileName(image.filename || `image-${index + 1}.${extensionFromContentType(parsed.contentType)}`),
+      contentType: parsed.contentType,
+      buffer: parsed.buffer,
+    };
+  }
+
+  const res = await fetch(url, { signal });
+  if (!res.ok) throw new Error(`fetch image failed: ${res.status} ${res.statusText}`);
+  const contentType = normalizeContentType(res.headers.get('content-type') || 'image/png');
+  const buffer = Buffer.from(await res.arrayBuffer());
+  return {
+    name: sanitizeFileName(image.filename || fileNameFromUrl(url, contentType, index)),
+    contentType,
+    buffer,
+  };
+}
+
+function parseDataUrl(value) {
+  const match = /^data:([^;,]+)?(;base64)?,(.*)$/i.exec(value);
+  if (!match) throw new Error('invalid data URL image');
+  const contentType = normalizeContentType(match[1] || 'image/png');
+  const buffer = match[2]
+    ? Buffer.from(match[3], 'base64')
+    : Buffer.from(decodeURIComponent(match[3]), 'utf8');
+  return { contentType, buffer };
+}
+
+function normalizeContentType(value) {
+  return String(value || 'image/png').split(';', 1)[0].trim().toLowerCase() || 'image/png';
+}
+
+function extensionFromContentType(contentType) {
+  return MIME_EXTENSIONS[normalizeContentType(contentType)] || 'png';
+}
+
+function fileNameFromUrl(value, contentType, index) {
+  try {
+    const url = new URL(value);
+    const last = decodeURIComponent(url.pathname.split('/').filter(Boolean).pop() || '');
+    if (last) return last;
+  } catch {}
+  return `image-${index + 1}.${extensionFromContentType(contentType)}`;
+}
+
+function sanitizeFileName(value) {
+  const cleaned = String(value || 'image.png')
+    .replace(/[\\/:*?"<>|\x00-\x1F]/g, '_')
+    .trim();
+  return (cleaned || 'image.png').slice(0, 160);
+}
+
+function makeImageReference({ fileName, url, fileId }) {
+  return {
+    id: String(Date.now() + Math.floor(Math.random() * 1000000)),
+    type: 'image',
+    title: fileName || 'image.png',
+    content: url,
+    favicon: '',
+    path: fileId || url,
+  };
+}
+
+function contentWithReferenceLabels(content, references) {
+  const text = String(content || '').trim();
+  const labels = references
+    .filter(ref => ref?.type === 'image' || ref?.type === 'document')
+    .map(ref => `@${ref.title || ref.path || ref.id}`)
+    .filter(Boolean);
+  if (!labels.length) return String(content || '');
+  return [text, labels.join(' ')].filter(Boolean).join('\n');
+}
+
+function buildHtmlContent(content, references) {
+  const paragraphs = String(content || '')
+    .split(/\n+/)
+    .map(line => line.trim())
+    .filter(Boolean)
+    .map(line => `<p>${escapeHtml(line)}</p>`);
+  if (references.length) {
+    paragraphs.push(`<p>${references.map(referenceToHtml).join('')}</p>`);
+  }
+  return paragraphs.length ? paragraphs.join('') : '<p></p>';
+}
+
+function referenceToHtml(reference) {
+  return `<tab-mention-node data-id="${escapeHtml(reference.id)}" data-reference="${escapeHtml(JSON.stringify(reference))}">${escapeHtml(reference.title || reference.type)}</tab-mention-node>`;
+}
+
+function escapeHtml(value) {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+export async function* chat({ cookie, version, signKey, sessionId, model = 'Default', content, images = [], references = [], metadatas = {}, signal }) {
+  const uploadedReferences = await uploadImageReferences({ cookie, version, signKey, images, signal });
+  const allReferences = [...references, ...uploadedReferences];
+  const requestContent = contentWithReferenceLabels(content, allReferences);
+  const requestMetadatas = { ...metadatas };
+  if (!requestMetadatas.html_content) {
+    requestMetadatas.html_content = buildHtmlContent(content, allReferences);
+  }
+
   const bodyStr = JSON.stringify({
     chat_session_id: sessionId,
     message_id: null,
-    content,
+    content: requestContent,
     selected_model: model,
     parallel_group_id: null,
     task_name: 'chat',
     agent_mode: false,
-    metadatas: { html_content: `<p>${content}</p>` },
-    references: [],
+    metadatas: requestMetadatas,
+    references: allReferences,
     entity: { key: 'd41d8cd98f00b204e9800998ecf8427e', extras: { type: 'tab', url: '' } },
   });
   const headers = {

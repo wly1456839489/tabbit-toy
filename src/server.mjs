@@ -18,6 +18,7 @@ import {
   anthropicInputToMessages,
   buildAnthropicMessage,
   buildOpenAiResponse,
+  contentToImages,
   contentToText,
   resolveAnthropicModel,
   responsesInputToMessages,
@@ -34,6 +35,7 @@ let sessionCacheAt = 0;
 
 const SIGN_KEY_TTL = 10 * 60 * 1000;  // 10 分钟刷新一次签名 key
 const SESSION_TTL = 5 * 60 * 1000;    // 5 分钟刷新一次会话列表
+const MAX_REQUEST_BODY_BYTES = 32 * 1024 * 1024;
 
 async function ensureSignKey() {
   if (config.signKey) return config.signKey;
@@ -77,12 +79,22 @@ function sendJson(res, status, obj) {
 function readBody(req) {
   return new Promise((resolve, reject) => {
     let data = '';
+    let rejected = false;
     req.on('data', c => {
+      if (rejected) return;
       data += c;
-      if (data.length > 1e6) reject(new Error('request body too large'));
+      if (Buffer.byteLength(data) > MAX_REQUEST_BODY_BYTES) {
+        rejected = true;
+        reject(new Error('request body too large'));
+        req.destroy();
+      }
     });
-    req.on('end', () => resolve(data));
-    req.on('error', reject);
+    req.on('end', () => {
+      if (!rejected) resolve(data);
+    });
+    req.on('error', err => {
+      if (!rejected) reject(err);
+    });
   });
 }
 
@@ -109,9 +121,17 @@ function messagesToContent(messages) {
   return valid.map(m => `[${roleLabel[m.role] || 'User'}]\n${contentToText(m.content)}`).join('\n\n');
 }
 
-async function collectTabbitText({ model, key, sessionId, content }) {
+function messagesToTabbitInput(messages) {
+  const valid = messages.filter(m => m && m.content != null);
+  return {
+    content: messagesToContent(valid),
+    images: valid.flatMap(m => contentToImages(m.content)),
+  };
+}
+
+async function collectTabbitText({ model, key, sessionId, content, images }) {
   let full = '';
-  for await (const ev of chat({ cookie: config.cookie, version: config.version, signKey: key, sessionId, model, content })) {
+  for await (const ev of chat({ cookie: config.cookie, version: config.version, signKey: key, sessionId, model, content, images })) {
     if (ev.event === 'message_chunk' && ev.data?.content) {
       full += ev.data.content;
     } else if (ev.event === 'error') {
@@ -170,10 +190,10 @@ async function handleChat(req, res, rawBody) {
     return sendJson(res, 400, { error: { message: 'messages is required and must be non-empty array' } });
   }
 
-  let key, sessionId, content;
+  let key, sessionId, content, images;
   try {
     [key, sessionId] = await Promise.all([ensureSignKey(), getSessionId()]);
-    content = messagesToContent(messages);
+    ({ content, images } = messagesToTabbitInput(messages));
   } catch (e) {
     return sendJson(res, 502, { error: { message: 'prepare failed: ' + e.message } });
   }
@@ -185,7 +205,7 @@ async function handleChat(req, res, rawBody) {
   if (!stream) {
     let full = '';
     try {
-      for await (const ev of chat({ cookie: config.cookie, version: config.version, signKey: key, sessionId, model, content })) {
+      for await (const ev of chat({ cookie: config.cookie, version: config.version, signKey: key, sessionId, model, content, images })) {
         if (ev.event === 'message_chunk' && ev.data?.content) {
           full += ev.data.content;
         } else if (ev.event === 'error') {
@@ -233,7 +253,7 @@ async function handleChat(req, res, rawBody) {
   sendChunk({ role: 'assistant' });
 
   try {
-    for await (const ev of chat({ cookie: config.cookie, version: config.version, signKey: key, sessionId, model, content, signal: ac.signal })) {
+    for await (const ev of chat({ cookie: config.cookie, version: config.version, signKey: key, sessionId, model, content, images, signal: ac.signal })) {
       if (ev.event === 'message_chunk' && ev.data?.content) {
         sendChunk({ content: ev.data.content });
       } else if (ev.event === 'error') {
@@ -268,10 +288,10 @@ async function handleResponses(req, res, rawBody) {
     return sendJson(res, 400, { error: { message: e.message } });
   }
 
-  let key, sessionId, content;
+  let key, sessionId, content, images;
   try {
     [key, sessionId] = await Promise.all([ensureSignKey(), getSessionId()]);
-    content = messagesToContent(messages);
+    ({ content, images } = messagesToTabbitInput(messages));
   } catch (e) {
     return sendJson(res, 502, { error: { message: 'prepare failed: ' + e.message } });
   }
@@ -282,7 +302,7 @@ async function handleResponses(req, res, rawBody) {
 
   if (!stream) {
     try {
-      const full = await collectTabbitText({ model, key, sessionId, content });
+      const full = await collectTabbitText({ model, key, sessionId, content, images });
       return sendJson(res, 200, buildOpenAiResponse({ id, outputId, created, model, text: full }));
     } catch (e) {
       if (e instanceof TabbitError) invalidateSession();
@@ -323,7 +343,7 @@ async function handleResponses(req, res, rawBody) {
   let full = '';
   let failed = false;
   try {
-    for await (const ev of chat({ cookie: config.cookie, version: config.version, signKey: key, sessionId, model, content, signal: ac.signal })) {
+    for await (const ev of chat({ cookie: config.cookie, version: config.version, signKey: key, sessionId, model, content, images, signal: ac.signal })) {
       if (ev.event === 'message_chunk' && ev.data?.content) {
         full += ev.data.content;
         writeSse(res, 'response.output_text.delta', {
@@ -403,10 +423,10 @@ async function handleAnthropicMessages(req, res, rawBody) {
     return sendJson(res, 400, { type: 'error', error: { type: 'invalid_request_error', message: e.message } });
   }
 
-  let key, sessionId, content;
+  let key, sessionId, content, images;
   try {
     [key, sessionId] = await Promise.all([ensureSignKey(), getSessionId()]);
-    content = messagesToContent(messages);
+    ({ content, images } = messagesToTabbitInput(messages));
   } catch (e) {
     return sendJson(res, 502, { type: 'error', error: { type: 'api_error', message: 'prepare failed: ' + e.message } });
   }
@@ -415,7 +435,7 @@ async function handleAnthropicMessages(req, res, rawBody) {
 
   if (!body.stream) {
     try {
-      const full = await collectTabbitText({ model, key, sessionId, content });
+      const full = await collectTabbitText({ model, key, sessionId, content, images });
       return sendJson(res, 200, buildAnthropicMessage({ id, model: requestedModel, text: full }));
     } catch (e) {
       if (e instanceof TabbitError) invalidateSession();
@@ -445,7 +465,7 @@ async function handleAnthropicMessages(req, res, rawBody) {
 
   let failed = false;
   try {
-    for await (const ev of chat({ cookie: config.cookie, version: config.version, signKey: key, sessionId, model, content, signal: ac.signal })) {
+    for await (const ev of chat({ cookie: config.cookie, version: config.version, signKey: key, sessionId, model, content, images, signal: ac.signal })) {
       if (ev.event === 'message_chunk' && ev.data?.content) {
         writeSse(res, 'content_block_delta', {
           type: 'content_block_delta',
