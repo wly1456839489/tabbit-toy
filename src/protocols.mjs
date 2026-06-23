@@ -14,18 +14,19 @@ function contentPartToText(part) {
   if (Array.isArray(part)) return contentToText(part);
   if (typeof part !== 'object') return String(part);
 
+  if (part.type === 'tool_use') {
+    return `[Tool use${part.id ? `: ${part.id}` : ''}: ${part.name || 'tool'}]\n${JSON.stringify(part.input ?? {})}`;
+  }
+  if (part.type === 'tool_result') {
+    const title = `[Tool result${part.tool_use_id ? `: ${part.tool_use_id}` : ''}${part.is_error ? ' error' : ''}]`;
+    return `${title}\n${contentToText(part.content)}`;
+  }
   if (typeof part.text === 'string') return part.text;
   if (typeof part.output_text === 'string') return part.output_text;
   if (typeof part.input_text === 'string') return part.input_text;
   if (typeof part.content === 'string') return part.content;
   if (Array.isArray(part.content)) return contentToText(part.content);
 
-  if (part.type === 'tool_use') {
-    return `[Tool use: ${part.name || 'tool'}]\n${JSON.stringify(part.input ?? {})}`;
-  }
-  if (part.type === 'tool_result') {
-    return `[Tool result]\n${contentToText(part.content)}`;
-  }
   if (contentPartToImage(part)) return '';
   if (part.type === 'input_file') return '[File input omitted]';
 
@@ -192,14 +193,14 @@ export function buildOpenAiResponse({ id, outputId, created, model, text }) {
   };
 }
 
-export function buildAnthropicMessage({ id, model, text }) {
+export function buildAnthropicMessage({ id, model, text = '', content, stopReason = 'end_turn' }) {
   return {
     id,
     type: 'message',
     role: 'assistant',
     model,
-    content: [{ type: 'text', text }],
-    stop_reason: 'end_turn',
+    content: content || [{ type: 'text', text }],
+    stop_reason: stopReason,
     stop_sequence: null,
     usage: { input_tokens: 0, output_tokens: 0 },
   };
